@@ -37,6 +37,14 @@ struct freeze_info {
 	float mask_right;
 	float mask_top;
 	float mask_bottom;
+
+	uint32_t mode;
+	uint32_t loop_type;
+	uint32_t loop_duration;
+	gs_texrender_t **frames;
+	uint32_t frame_count;
+	uint32_t frames_captured;
+	uint64_t play_step;
 };
 
 static const char *freeze_get_name(void *type_data)
@@ -59,6 +67,51 @@ static void free_textures(struct freeze_info *f, bool destroy_effect)
 	obs_leave_graphics();
 }
 
+static void free_frames(struct freeze_info *f)
+{
+	f->frames_captured = 0;
+	f->play_step = 0;
+	if (!f->frames)
+		return;
+	obs_enter_graphics();
+	for (uint32_t i = 0; i < f->frame_count; i++)
+		gs_texrender_destroy(f->frames[i]);
+	obs_leave_graphics();
+	bfree(f->frames);
+	f->frames = NULL;
+	f->frame_count = 0;
+}
+
+static void alloc_frames(struct freeze_info *f)
+{
+	struct obs_video_info ovi;
+	uint64_t count = 0;
+	if (obs_get_video_info(&ovi) && ovi.fps_den)
+		count = (uint64_t)f->loop_duration * ovi.fps_num / ((uint64_t)ovi.fps_den * 1000);
+	if (count < 2)
+		count = 2;
+	if (count > FREEZE_LOOP_MAX_FRAMES)
+		count = FREEZE_LOOP_MAX_FRAMES;
+	f->frame_count = (uint32_t)count;
+	f->frames = bzalloc(sizeof(gs_texrender_t *) * f->frame_count);
+	f->frames_captured = 0;
+	f->play_step = 0;
+}
+
+static uint32_t loop_index(struct freeze_info *f)
+{
+	const uint32_t n = f->frame_count;
+	if (f->frames_captured < n)
+		return f->frames_captured ? f->frames_captured - 1 : 0;
+	// recording showed positions 0..n-1, playback continues from there
+	const uint64_t pos = n - 1 + f->play_step;
+	if (f->loop_type != FREEZE_LOOP_BOOMERANG)
+		return (uint32_t)(pos % n);
+	const uint64_t period = 2 * (uint64_t)n - 2;
+	const uint64_t p = pos % period;
+	return (uint32_t)(p < n ? p : period - p);
+}
+
 static inline bool check_size(struct freeze_info *f)
 {
 	obs_source_t *target = obs_filter_get_target(f->source);
@@ -78,6 +131,7 @@ static inline bool check_size(struct freeze_info *f)
 		f->cx = cx;
 		f->cy = cy;
 		free_textures(f, false);
+		free_frames(f);
 		return true;
 	}
 	return false;
@@ -100,6 +154,13 @@ static void freeze_update(void *data, obs_data_t *settings)
 	freeze->mask_right = (float)obs_data_get_double(settings, "mask_right") / 100.0f;
 	freeze->mask_top = (float)obs_data_get_double(settings, "mask_top") / 100.0f;
 	freeze->mask_bottom = (float)obs_data_get_double(settings, "mask_bottom") / 100.0f;
+	const uint32_t mode = (uint32_t)obs_data_get_int(settings, "mode");
+	if (mode != freeze->mode) {
+		freeze->mode = mode;
+		freeze->processed_frame = false;
+	}
+	freeze->loop_type = (uint32_t)obs_data_get_int(settings, "loop_type");
+	freeze->loop_duration = (uint32_t)obs_data_get_int(settings, "loop_duration");
 }
 
 static void *freeze_create(obs_data_t *settings, obs_source_t *source)
@@ -134,10 +195,11 @@ static void freeze_destroy(void *data)
 		obs_hotkey_unregister(freeze->screenshot_hotkey);
 	}
 	free_textures(freeze, true);
+	free_frames(freeze);
 	bfree(freeze);
 }
 
-static void draw_frame(struct freeze_info *f)
+static void draw_frame(struct freeze_info *f, gs_texrender_t *render)
 {
 	gs_effect_t *effect = f->effect;
 	if (f->mask)
@@ -146,7 +208,7 @@ static void draw_frame(struct freeze_info *f)
 	if (!effect)
 		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-	gs_texture_t *tex = gs_texrender_get_texture(f->render);
+	gs_texture_t *tex = render ? gs_texrender_get_texture(render) : NULL;
 	if (tex) {
 		gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
 		gs_effect_set_texture(image, tex);
@@ -169,31 +231,18 @@ static void draw_frame(struct freeze_info *f)
 	}
 }
 
-static void freeze_video_render(void *data, gs_effect_t *effect)
+static void capture_frame(struct freeze_info *freeze, obs_source_t *target, obs_source_t *parent, gs_texrender_t **render)
 {
-	UNUSED_PARAMETER(effect);
-	struct freeze_info *freeze = data;
-	obs_source_t *target = obs_filter_get_target(freeze->source);
-	obs_source_t *parent = obs_filter_get_parent(freeze->source);
-
-	if (!freeze->target_valid || !target || !parent) {
-		obs_source_skip_video_filter(freeze->source);
-		return;
-	}
-	if (freeze->processed_frame) {
-		draw_frame(freeze);
-		return;
-	}
-	if (!freeze->render) {
-		freeze->render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	if (!*render) {
+		*render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	} else {
-		gs_texrender_reset(freeze->render);
+		gs_texrender_reset(*render);
 	}
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
-	if (gs_texrender_begin(freeze->render, freeze->cx, freeze->cy)) {
+	if (gs_texrender_begin(*render, freeze->cx, freeze->cy)) {
 		uint32_t parent_flags = obs_source_get_output_flags(target);
 		bool custom_draw = (parent_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
 		bool async = (parent_flags & OBS_SOURCE_ASYNC) != 0;
@@ -208,11 +257,43 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 		else
 			obs_source_video_render(target);
 
-		gs_texrender_end(freeze->render);
+		gs_texrender_end(*render);
 	}
 
 	gs_blend_state_pop();
-	draw_frame(freeze);
+}
+
+static void freeze_video_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(effect);
+	struct freeze_info *freeze = data;
+	obs_source_t *target = obs_filter_get_target(freeze->source);
+	obs_source_t *parent = obs_filter_get_parent(freeze->source);
+
+	if (!freeze->target_valid || !target || !parent) {
+		obs_source_skip_video_filter(freeze->source);
+		return;
+	}
+	if (freeze->mode == FREEZE_MODE_LOOP) {
+		if (!freeze->frames)
+			alloc_frames(freeze);
+		// processed_frame is reset every tick in loop mode, so capture at most once per frame
+		if (!freeze->processed_frame) {
+			if (freeze->frames_captured < freeze->frame_count) {
+				capture_frame(freeze, target, parent, &freeze->frames[freeze->frames_captured]);
+				freeze->frames_captured++;
+			}
+			freeze->processed_frame = true;
+		}
+		draw_frame(freeze, freeze->frames[loop_index(freeze)]);
+		return;
+	}
+	if (freeze->processed_frame) {
+		draw_frame(freeze, freeze->render);
+		return;
+	}
+	capture_frame(freeze, target, parent, &freeze->render);
+	draw_frame(freeze, freeze->render);
 	freeze->processed_frame = true;
 }
 
@@ -223,11 +304,34 @@ static void prop_list_add_actions(obs_property_t *p)
 	obs_property_list_add_int(p, obs_module_text("FreezeDisable"), FREEZE_ACTION_DISABLE);
 }
 
+static bool mode_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	const bool loop = obs_data_get_int(settings, "mode") == FREEZE_MODE_LOOP;
+	obs_property_set_visible(obs_properties_get(props, "loop_duration"), loop);
+	obs_property_set_visible(obs_properties_get(props, "loop_type"), loop);
+	obs_property_set_visible(obs_properties_get(props, "refresh_interval"), !loop);
+	return true;
+}
+
 static obs_properties_t *freeze_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	obs_properties_t *ppts = obs_properties_create();
-	obs_property_t *p = obs_properties_add_int(ppts, "duration", obs_module_text("Duration"), 0, 100000, 1000);
+	obs_property_t *p = obs_properties_add_list(ppts, "mode", obs_module_text("Mode"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Freeze"), FREEZE_MODE_FREEZE);
+	obs_property_list_add_int(p, obs_module_text("Loop"), FREEZE_MODE_LOOP);
+	obs_property_set_modified_callback(p, mode_changed);
+
+	p = obs_properties_add_int(ppts, "loop_duration", obs_module_text("LoopDuration"), 100, FREEZE_LOOP_MAX_DURATION, 100);
+	obs_property_int_set_suffix(p, "ms");
+	obs_property_set_long_description(p, obs_module_text("LoopDuration.Description"));
+
+	p = obs_properties_add_list(ppts, "loop_type", obs_module_text("LoopType"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("LoopRepeat"), FREEZE_LOOP_REPEAT);
+	obs_property_list_add_int(p, obs_module_text("LoopBoomerang"), FREEZE_LOOP_BOOMERANG);
+
+	p = obs_properties_add_int(ppts, "duration", obs_module_text("Duration"), 0, 100000, 1000);
 	obs_property_int_set_suffix(p, "ms");
 	p = obs_properties_add_int(ppts, "refresh_interval", obs_module_text("RefreshInterval"), 0, 100000, 1000);
 	obs_property_int_set_suffix(p, "ms");
@@ -278,7 +382,7 @@ static obs_properties_t *freeze_properties(void *data)
 
 void freeze_defaults(obs_data_t *settings)
 {
-	UNUSED_PARAMETER(settings);
+	obs_data_set_default_int(settings, "loop_duration", 1000);
 }
 
 void freeze_do_action(struct freeze_info *freeze, uint32_t action)
@@ -374,6 +478,10 @@ static void freeze_tick(void *data, float t)
 		f->duration += t;
 		if (f->duration_max && f->duration * 1000.0 > f->duration_max) {
 			obs_source_set_enabled(f->source, false);
+		} else if (f->mode == FREEZE_MODE_LOOP) {
+			if (f->frames && f->frames_captured >= f->frame_count)
+				f->play_step++;
+			f->processed_frame = false;
 		} else if (f->refresh_interval && f->duration > f->last_refresh &&
 			   (f->duration - f->last_refresh) * 1000.0 >= f->refresh_interval) {
 			f->processed_frame = false;
@@ -392,6 +500,7 @@ static void freeze_tick(void *data, float t)
 		f->processed_frame = false;
 		f->duration = 0.0f;
 		f->last_refresh = 0.0f;
+		free_frames(f);
 	}
 	if (f->hotkey == OBS_INVALID_HOTKEY_PAIR_ID) {
 		obs_source_t *parent = obs_filter_get_parent(f->source);
